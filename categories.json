@@ -1,13 +1,13 @@
 {
   "status": "frozen",
   "frozen_at": "2026-09-20",
-  "note": "Personal category enum for labeled records. Frozen per scope.md before any labeling (issue #3) — never changed after this date. Extracted categories must match these strings exactly.",
+  "note": "Personal category enum for labeled records. Amended 2026-09-20 (same day as first freeze, before any eval ran): superseded the provisional 6-category list after reviewing what was actually recorded in ground_truth.csv — these strings are verbatim from the recorded ground truth. Never changed after this date. Extracted categories must match these strings exactly.",
   "categories": [
-    "grocery & eat out",
-    "catering payment",
-    "fitness & health",
-    "transport",
-    "deposits & tax",
-    "Misc and souvenir"
+    "Misc and souvenir",
+    "health & fitness",
+    "grocery&eat out",
+    "deposit",
+    "tuition fee",
+    "transport"
   ]
 }

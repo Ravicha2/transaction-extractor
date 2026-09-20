@@ -16,8 +16,8 @@ the corpus I have and the pain I feel are bank screenshots.
   date headers ("Today", "Yesterday", "Tue 15 Sep").
 - Labels: hand-labeled by me, cross-checked against my bank transaction history.
 - Category enum — **frozen 2026-09-20** in `categories.json` (source of truth), never changed after:
-  grocery & eat out, catering payment, fitness & health, transport, deposits & tax,
-  Misc and souvenir.
+  Misc and souvenir, health & fitness, grocery&eat out, deposit, tuition fee, transport.
+  Amended same day to match the categories actually used in `ground_truth.csv` (verbatim strings).
 
 ## Schema
 
