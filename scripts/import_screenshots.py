@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Import pipeline: sheet tracer (issue #13) + plan phase (issue #15).
+"""Import pipeline: sheet tracer (issue #13) + plan (issue #15) + commit (issue #16).
 
 --tracer-sheet proves the sheet layer of the import pipeline with zero writes
 to real ledger data:
@@ -38,6 +38,25 @@ and a staging JSON per screenshot in `data/out/import/<stem>.json`. The sheet
 is only read (values.get, no append); screenshots stay in `data/new/` (zero
 file moves); HEIC files are rejected with a `sips -s format png` hint.
 
+--commit is the write half: it consumes plan-phase staging JSONs and nothing
+else (never re-runs OCR/jev — a retry never re-pays model calls):
+
+`--commit --staging data/out/import/<stem>.json --tab 'Sep 26'` re-validates
+the target tab's headers (catching wrong-tab mistakes like legacy-format
+'Aug 26'), refuses stale staging (the staging JSON records the tab's row count
+at plan time; if the tab's row count changed since, abort — a crashed
+mid-append commit also shows up here), refuses records review left flagged
+with a null date (edit or reject them in staging first), ensures the `source`
+header exists in F1 (added once on a tab's first import), then appends ALL
+staging rows in ONE `values.append` (USER_ENTERED, INSERT_ROWS; columns
+`date | vendor | category | amount | source` with Total left blank in E for
+manual drag-fill). The appended rows are read back and verified before
+anything moves. Only after a verified append are the image + sidecar moved
+from `data/new/` to `data/processed/` (the staging JSON rides along, so a
+committed screenshot can never be committed twice). Invariant: a file in
+`processed/` ⟺ its rows are in the sheet. Any append failure leaves files in
+`data/new/` and staging untouched.
+
 The sheet-I/O helpers here (get/append/validation) are the reusable import
 block for the later commit slice. No new Python dependencies: everything
 shells out to `gws`/`tesseract` or reuses the existing arms.
@@ -47,6 +66,8 @@ Usage:
     uv run python scripts/import_screenshots.py --tracer-sheet --sheet <ID> --tab "Sep 26"
     uv run python scripts/import_screenshots.py --plan --tab 'Sep 26'
     uv run python scripts/import_screenshots.py --plan --tab 'Sep 26' --json
+    uv run python scripts/import_screenshots.py --commit --tab 'Sep 26' \
+        --staging data/out/import/<stem>.json [more.json ...]
 """
 
 import argparse
@@ -65,6 +86,7 @@ from sticky_dates import parse_capture_time  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_NEW = ROOT / "data" / "new"
+DATA_PROCESSED = ROOT / "data" / "processed"
 DATA_IMPORT = ROOT / "data" / "out" / "import"
 ERRORS_PATH = DATA_IMPORT / "_errors.json"
 
@@ -88,7 +110,9 @@ HEIC_EXTS = {".heic", ".heif"}
 
 
 class TracerError(SystemExit):
-    """Fatal, user-facing failure. No partial writes precede it."""
+    """Fatal, user-facing failure. Commit refuses strictly before any write;
+    the one sanctioned post-append failure (read-back mismatch) says so
+    explicitly and moves nothing."""
 
     def __init__(self, message: str):
         print(f"ERROR: {message}", file=sys.stderr)
@@ -205,12 +229,12 @@ def delete_tab(sheet_id: str, sheet_tab_id: int) -> None:
                    {"requests": [{"deleteSheet": {"sheetId": sheet_tab_id}}]})
 
 
-def append_rows(sheet_id: str, tab: str, rows: list[list[str]]) -> None:
-    gws_values_call("append",
-                    {"spreadsheetId": sheet_id, "range": f"'{tab}'!A1",
-                     "valueInputOption": "USER_ENTERED",
-                     "insertDataOption": "INSERT_ROWS"},
-                    {"values": rows})
+def append_rows(sheet_id: str, tab: str, rows: list[list[str]]) -> dict:
+    return gws_values_call("append",
+                           {"spreadsheetId": sheet_id, "range": f"'{tab}'!A1",
+                            "valueInputOption": "USER_ENTERED",
+                            "insertDataOption": "INSERT_ROWS"},
+                           {"values": rows})
 
 
 def roundtrip_scratch_tab(sheet_id: str) -> None:
@@ -400,12 +424,13 @@ def flag_collisions(screens: list[dict], sheet_rows: list[list[str]]) -> dict:
     }
 
 
-def write_staging(scr: dict, tab: str) -> Path:
+def write_staging(scr: dict, tab: str, tab_rows: int) -> Path:
     payload = {
         "file": scr["file"],
         "capture_time": scr["capture_time"],
         "engine": scr["engine"],
         "target_tab": tab,
+        "tab_rows_at_plan": tab_rows,
         "planned_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "phantom_lines_dropped": scr["phantom_lines_dropped"],
         "n_records": len(scr["records"]),
@@ -490,7 +515,7 @@ def plan(args: argparse.Namespace) -> int:
     sheet_rows = get_values(sheet_id, f"'{tab}'!A1:E")
     counts = flag_collisions(screens, sheet_rows)
 
-    staged = [write_staging(scr, tab) for scr in screens]
+    staged = [write_staging(scr, tab, len(sheet_rows)) for scr in screens]
     ERRORS_PATH.write_text(json.dumps(errors, indent=2) + "\n", encoding="utf-8")
 
     n_records = sum(len(s["records"]) for s in screens)
@@ -526,14 +551,229 @@ def plan(args: argparse.Namespace) -> int:
     return 1 if errors else 0
 
 
+# ---------------------------------------------------------------------------
+# Commit phase (issue #16)
+# ---------------------------------------------------------------------------
+
+def ensure_source_header(sheet_id: str, tab: str) -> None:
+    """F1 must read `source`; written once on a tab's first import."""
+    row = get_values(sheet_id, f"'{tab}'!F1:F1")
+    got = str(row[0][0]).strip() if row and row[0] else ""
+    if got == "source":
+        print(f"  {tab!r}!F1 = 'source' (already present)")
+        return
+    if got:
+        raise TracerError(
+            f"tab {tab!r}: F1 is {got!r}, expected 'source' or empty — "
+            "fix the tab layout before importing")
+    gws_values_call("update",
+                    {"spreadsheetId": sheet_id, "range": f"'{tab}'!F1",
+                     "valueInputOption": "USER_ENTERED"},
+                    {"values": [["source"]]})
+    print(f"  added 'source' header at {tab!r}!F1")
+
+
+def build_rows(doc: dict, staging_name: str) -> list[list[str]]:
+    """Staging records → sheet rows: date | vendor | category | amount | ''
+    | source. Total (E) stays blank for manual drag-fill. Refuses records
+    review left unresolved (null/unparseable date, unusable amount)."""
+    rows = []
+    for i, r in enumerate(doc.get("records", [])):
+        where = f"{staging_name} record {i} ({r.get('vendor') or 'unknown vendor'})"
+        date = parse_sheet_date(r.get("date"))
+        if not date:
+            raise TracerError(
+                f"{where} still has no usable date — review must edit (fill "
+                "the date) or reject (delete the record) it in the staging "
+                "JSON first; nothing was appended")
+        amount = r.get("amount")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            raise TracerError(
+                f"{where} has no usable amount ({amount!r}) — edit the "
+                "staging JSON first; nothing was appended")
+        rows.append([
+            date,
+            str(r.get("vendor") or ""),
+            str(r.get("category") or ""),
+            f"{float(amount):.2f}",
+            "",  # Total: manual drag-fill
+            str(doc["file"]),
+        ])
+    return rows
+
+
+def verify_appended(sheet_id: str, tab: str, updated_range: str,
+                    rows: list[list[str]]) -> None:
+    """Read the appended range back and verify it (tracer pattern) BEFORE any
+    file moves. Dates/amounts compared normalized (USER_ENTERED reformats)."""
+    m = re.search(r"!([A-Z]+)(\d+):([A-Z]+)(\d+)$", updated_range)
+    if not m:
+        raise TracerError(
+            f"could not parse append range {updated_range!r} — check {tab!r} "
+            "manually; files NOT moved, staging retained")
+    start_row = int(m.group(2))
+    readback = get_values(sheet_id,
+                          f"'{tab}'!A{start_row}:F{start_row + len(rows) - 1}")
+    problems = []
+    if len(readback) != len(rows):
+        problems.append(f"expected {len(rows)} row(s) at {updated_range}, "
+                        f"read back {len(readback)}")
+    for i, (want, got) in enumerate(zip(rows, readback)):
+        got = [str(c).strip() for c in got] + [""] * (6 - len(got))
+        date, vendor, category, amount, _total, source = want
+        if parse_sheet_date(got[0]) != date:
+            problems.append(f"row {i}: date {got[0]!r} != {date!r}")
+        if got[1] != vendor:
+            problems.append(f"row {i}: vendor {got[1]!r} != {vendor!r}")
+        if got[2] != category:
+            problems.append(f"row {i}: category {got[2]!r} != {category!r}")
+        if parse_sheet_amount(got[3]) != parse_sheet_amount(amount):
+            problems.append(f"row {i}: amount {got[3]!r} != {amount!r}")
+        if got[4]:
+            problems.append(f"row {i}: Total should be blank, got {got[4]!r}")
+        if got[5] != source:
+            problems.append(f"row {i}: source {got[5]!r} != {source!r}")
+    if problems:
+        raise TracerError(
+            "appended rows failed read-back verification — the rows ARE in "
+            f"{tab!r}; inspect the tab manually and fix before re-running "
+            "anything. Files NOT moved, staging retained:\n  "
+            + "\n  ".join(problems))
+    print("read-back verified: dates, vendors, categories, amounts, blank "
+          "Total, source per row")
+
+
+def move_to_processed(docs: list[tuple[Path, dict]]) -> None:
+    """Post-verified-append only: image + sidecar out of data/new/, staging
+    JSON rides along (from data/out/import) so a committed screenshot can
+    never be committed twice."""
+    DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
+    for p, doc in docs:
+        stem = Path(doc["file"]).stem
+        img = DATA_NEW / doc["file"]
+        img.rename(DATA_PROCESSED / doc["file"])
+        sidecar = DATA_NEW / f"{stem}.meta.json"
+        if sidecar.is_file():
+            sidecar.rename(DATA_PROCESSED / sidecar.name)
+            print(f"  moved {doc['file']} + {sidecar.name} → {DATA_PROCESSED.relative_to(ROOT)}")
+        else:
+            print(f"  moved {doc['file']} → {DATA_PROCESSED.relative_to(ROOT)} "
+                  "(no sidecar found)")
+        if p.resolve().parent == DATA_IMPORT.resolve():
+            p.rename(DATA_PROCESSED / p.name)
+            print(f"  moved staging {p.name} → {DATA_PROCESSED.relative_to(ROOT)}")
+        else:
+            print(f"  staging {p} left in place (outside {DATA_IMPORT.relative_to(ROOT)})")
+
+
+def load_staging(raw_paths: list[str]) -> list[tuple[Path, dict]]:
+    docs = []
+    for raw in raw_paths:
+        p = Path(raw)
+        if not p.is_file():
+            raise TracerError(f"staging file not found: {p}")
+        try:
+            doc = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise TracerError(f"{p}: not valid JSON ({exc})")
+        if not isinstance(doc, dict) or not doc.get("file") \
+                or not isinstance(doc.get("records"), list):
+            raise TracerError(
+                f"{p}: not a plan-phase staging JSON (need 'file' + 'records')")
+        docs.append((p, doc))
+    return docs
+
+
+def commit(args: argparse.Namespace) -> int:
+    preflight_auth()
+    print("auth: gws token valid")
+
+    sheet_id = resolve_sheet_id(args)
+    docs = load_staging(args.staging)
+
+    tab = args.tab or datetime.now().strftime("%b %y")
+    for p, doc in docs:
+        if doc.get("target_tab") != tab:
+            raise TracerError(
+                f"{p.name} was planned for tab {doc.get('target_tab')!r}, "
+                f"not {tab!r} — pass the tab it was planned for, or re-plan")
+
+    require_tab(sheet_id, tab)
+    print(f"workbook {sheet_id}: tab {tab!r} found")
+    validate_headers(sheet_id, tab)
+    print(f"headers of {tab!r}: {' | '.join(EXPECTED_HEADERS)} ✓")
+
+    # Freshness: the tab must look exactly as it did when the plan was made.
+    now_rows = len(get_values(sheet_id, f"'{tab}'!A1:E"))
+    for p, doc in docs:
+        at_plan = doc.get("tab_rows_at_plan")
+        if at_plan is None:
+            raise TracerError(
+                f"{p.name} has no tab_rows_at_plan — staging from an older "
+                "plan format; re-run --plan and review before committing")
+        if at_plan != now_rows:
+            raise TracerError(
+                f"stale staging: {p.name} was planned against {at_plan} "
+                f"row(s) in {tab!r}, but the tab now has {now_rows} row(s) — "
+                "the sheet changed since the plan. Re-run --plan and review "
+                "again; if a previous commit crashed mid-append, check the "
+                "tab for already-appended rows first. Nothing was appended.")
+
+    # All refusal checks happen BEFORE any write; one bad file aborts all.
+    rows = []
+    for p, doc in docs:
+        img = DATA_NEW / doc["file"]
+        if (DATA_PROCESSED / doc["file"]).exists():
+            raise TracerError(
+                f"{doc['file']} is already in {DATA_PROCESSED.relative_to(ROOT)} "
+                "— its rows were likely committed before; refusing to append "
+                "twice")
+        if not img.is_file():
+            raise TracerError(
+                f"screenshot {img} not found in data/new/ — commit only moves "
+                "what plan staged; restore it or re-plan")
+        rows += build_rows(doc, p.name)
+
+    flagged = sum(1 for _, doc in docs for r in doc["records"] if r.get("flags"))
+    if flagged:
+        names = ", ".join(p.name for p, doc in docs
+                          if any(r.get("flags") for r in doc["records"]))
+        print(f"note: {flagged} flagged record(s) still in staging ({names}) — "
+              "committing as instructed")
+
+    if not rows:
+        print("staging has no records — nothing to commit")
+        return 0
+
+    ensure_source_header(sheet_id, tab)
+    resp = append_rows(sheet_id, tab, rows)
+    updated = resp.get("updates", {})
+    rng = updated.get("updatedRange", "")
+    print(f"appended {len(rows)} row(s) in one values.append → {rng or '?'}")
+
+    verify_appended(sheet_id, tab, rng, rows)
+    move_to_processed(docs)
+    print(f"commit complete: {tab!r} now holds every committed screenshot's "
+          "rows (processed/ ⟺ in sheet)")
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Import pipeline (issue #13: sheet tracer, #15: plan phase)")
+        description="Import pipeline (issue #13: sheet tracer, #15: plan "
+                    "phase, #16: commit phase)")
     parser.add_argument("--tracer-sheet", action="store_true",
                         help="run the sheet-layer round-trip tracer")
     parser.add_argument("--plan", action="store_true",
                         help="plan phase: scan data/new/, extract + flag, write "
                              "staging JSONs — reads the sheet, never writes it")
+    parser.add_argument("--commit", action="store_true",
+                        help="commit phase: append reviewed staging rows to "
+                             "the tab in ONE values.append, then move the "
+                             "screenshots to data/processed/")
+    parser.add_argument("--staging", nargs="+", default=None, metavar="JSON",
+                        help="with --commit: one or more plan-phase staging "
+                             "JSONs (data/out/import/<stem>.json)")
     parser.add_argument("--json", action="store_true",
                         help="with --plan: machine-readable JSON on stdout "
                              "(review table moves to stderr)")
@@ -543,15 +783,23 @@ def main() -> None:
                         help="target tab (default: current month, e.g. 'Sep 26')")
     args = parser.parse_args()
 
-    if args.tracer_sheet and args.plan:
-        raise TracerError("pick one mode: --tracer-sheet or --plan")
+    modes = [m for m in (args.tracer_sheet, args.plan, args.commit) if m]
+    if len(modes) > 1:
+        raise TracerError("pick one mode: --tracer-sheet, --plan or --commit")
     if args.json and not args.plan:
         raise TracerError("--json only applies to --plan")
+    if args.staging and not args.commit:
+        raise TracerError("--staging only applies to --commit")
+    if args.commit and not args.staging:
+        raise TracerError("--commit needs --staging <plan JSON(s)> — "
+                          "never commit without the reviewed plan")
 
     if args.tracer_sheet:
         tracer_sheet(args)
     elif args.plan:
         raise SystemExit(plan(args))
+    elif args.commit:
+        raise SystemExit(commit(args))
     else:
         parser.print_help()
         raise TracerError("pick a mode, e.g. --plan or --tracer-sheet")
