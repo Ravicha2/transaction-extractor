@@ -43,7 +43,9 @@ LABELS_PATH = DATA_RAW / "ground_truth.csv"
 ARMS = {"regex": ROOT / "data" / "out" / "regex",
         "needle3": ROOT / "data" / "out" / "needle3",
         "hybrid": ROOT / "data" / "out" / "hybrid",
-        "sklearn": ROOT / "data" / "out" / "sklearn"}
+        "sklearn": ROOT / "data" / "out" / "sklearn",
+        "tabfm": ROOT / "data" / "out" / "tabfm",
+        "jev": ROOT / "data" / "out" / "jev"}
 
 BARS = {"record_recovery": 90.0, "category_accuracy": 85.0}
 

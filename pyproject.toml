@@ -5,6 +5,10 @@ description = "Bank screenshot to categorized transactions: a measured needle3 t
 requires-python = ">=3.13"
 dependencies = [
     "cactus-needle==3.0.2",
+    "huggingface-hub>=1.32.0",
     "pydantic>=2.0",
+    "safetensors>=0.8.0",
     "scikit-learn>=1.9.1",
+    "tabfm>=1.0.1",
+    "torch>=2.14.0",
 ]
