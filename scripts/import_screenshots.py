@@ -27,8 +27,11 @@ capture sidecar (make_sidecars.capture_time conventions), Tesseract OCR
 (run_ocr.ocr_image), phantom pre-filter (summary/balance lines — 'spend this
 month', 'spending', 'available', 'balance' — dropped before extraction so they
 can never become records), hybrid field extraction
-(run_hybrid_arm.extract_records), one Jev choice call per record (run_jev_arm
-patterns). Then ONE values.get collision pass flags (date, amount) pairs
+(run_hybrid_arm.extract_records), one Jev call per record carrying two
+mixed-type questions: the frozen enum category choice plus a noul
+vendor-sanity check — vendors that read as mangled OCR are flagged
+`vendor-suspect` for review to edit or reject, never discarded. Then ONE
+values.get collision pass flags (date, amount) pairs
 already in the target tab (`already-in-sheet`) and duplicates across this
 run's screenshots (`re-shown`); null-date records are pre-flagged (`no-date`)
 — review must edit or reject those, they are never silently plan'able as-is.
@@ -93,6 +96,9 @@ import os
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -114,7 +120,8 @@ EXPECTED_HEADERS = ["date", "vendor", "category", "amount", "Total"]
 TRACER_ROW_PREFIX = "sheet-tracer"
 
 PLAN_ENGINE = ("plan: run_ocr + phantom pre-filter + hybrid extraction "
-               "+ Jev choice mapper (import pipeline, issue #15)")
+               "+ Jev (category choice + noul vendor sanity) "
+               "(import pipeline, issue #15)")
 
 # Summary/balance furniture the bank app paints above the transaction list;
 # their amounts ('spend this month' = -15,670.03 class) must never reach staging.
@@ -357,13 +364,18 @@ def extract_screenshot(img: Path, stream=sys.stdout) -> dict:
     key = load_api_key()
     for r in records:
         r["category_printed"] = clean_printed(r["category_printed"])
+        r["flags"] = []
         if r["vendor"] or r["category_printed"]:
             state = (f"Vendor: {r['vendor'] or 'unknown'}\n"
                      f"Printed bank label: {r['category_printed'] or 'none'}")
-            r["category"], r["category_confidence"], _ = jev_choice(key, state)
-        else:
-            r["category"], r["category_confidence"] = None, None
-        r["flags"] = []
+            if r["vendor"]:
+                r["category"], r["category_confidence"], _, sane = \
+                    jev_record(key, state)
+                if sane is not None and sane < VENDOR_SANE_THRESHOLD:
+                    r["flags"].append("vendor-suspect")
+            else:
+                r["category"], r["category_confidence"], _ = \
+                    jev_choice(key, state)
     return {
         "file": img.name,
         "capture_time": capture_iso,
@@ -405,9 +417,78 @@ def parse_sheet_amount(raw) -> float | None:
         return None
 
 
+def display_date(iso: str | None) -> str:
+    """ISO → dd/mm/yyyy for human-facing surfaces (AUS workbook); staging
+    JSONs and sheet rows stay ISO."""
+    if not iso:
+        return "??/??/????"
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return iso
+
+
+# Vendor sanity rides the same Jev call as the category choice: a noul
+# (yes/no) question judges whether the OCR vendor line is a clean merchant
+# name. Below this threshold the record is flagged vendor-suspect — review
+# edits or rejects it; nothing is ever discarded outright. Tunable in the
+# #18 shakedown (observed: clean ≈ 0.5, mangled ≈ 0.15).
+VENDOR_SANE_THRESHOLD = 0.35
+
+
+def jev_record(key: str, state: str) -> tuple[str | None, float | None,
+                                              str | None, float | None]:
+    """One Jev call, two mixed-type questions: the frozen enum category
+    choice (payload identical to run_jev_arm.jev_choice) plus a noul
+    vendor-sanity check. Returns (category, confidence, model, vendor_sane)
+    where vendor_sane is the 0..1 probability the OCR vendor line is a
+    clean merchant name (None if the API withheld it)."""
+    from run_jev_arm import API_URL, CATEGORIES, CRITERIA, MODEL
+    body = json.dumps({
+        "state": state,
+        "model": MODEL,
+        "questions": {
+            "category": {
+                "type": "choice",
+                "instructions": "Which enum category best fits this bank transaction?",
+                "criteria": CRITERIA,
+            },
+            "vendor_sane": {
+                "type": "noul",
+                "instructions": ("The vendor string above was read off a bank screenshot "
+                                 "by OCR. It is a clean, correctly-read merchant name "
+                                 "with no OCR artifacts."),
+                "criteria": {"true": "a proper merchant name as-is",
+                             "false": "contains OCR artifacts or is not a merchant name"},
+            },
+        },
+    }).encode("utf-8")
+    req = urllib.request.Request(API_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    })
+    last_exc = None
+    for attempt in range(3):  # retry transient failures, back off politely
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                payload = json.loads(resp.read())
+            answer = payload["answers"]["category"]
+            sane = payload["answers"].get("vendor_sane", {}).get("noul")
+            return (answer.get("choice") if answer.get("choice") in CATEGORIES else None,
+                    answer.get("confidence"), payload.get("model"),
+                    float(sane) if isinstance(sane, (int, float)) else None)
+        except (urllib.error.URLError, urllib.error.HTTPError, KeyError,
+                json.JSONDecodeError, TypeError, ValueError) as exc:
+            last_exc = exc
+            time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"jev api failed after 3 attempts: {last_exc}")
+
+
 def flag_collisions(screens: list[dict], sheet_rows: list[list[str]]) -> dict:
     """One collision pass over the already-fetched tab: (date, amount) already
-    in the sheet, re-showing across this run's screenshots, null dates."""
+    in the sheet, re-showing across this run's screenshots, null dates.
+    vendor-suspect flags are attached earlier, at extraction (Jev noul), and
+    only counted here."""
     existing = set()
     for row in sheet_rows[1:]:
         d = parse_sheet_date(row[0] if row else None)
@@ -438,6 +519,7 @@ def flag_collisions(screens: list[dict], sheet_rows: list[list[str]]) -> dict:
         "already-in-sheet": flags.count("already-in-sheet"),
         "re-shown": flags.count("re-shown"),
         "no-date": flags.count("no-date"),
+        "vendor-suspect": flags.count("vendor-suspect"),
     }
 
 
@@ -471,7 +553,7 @@ def review_table(scr: dict) -> str:
         vendor = (r["vendor"] or "—")[:38]
         flags = ",".join(r["flags"]) or "-"
         lines.append(
-            f"{r['date'] or '????-??-??':<10} | {vendor:<38} | "
+            f"{display_date(r['date']):<10} | {vendor:<38} | "
             f"{r['amount']:>9.2f} | {cat:<32} | {flags}")
     return "\n".join(lines)
 
@@ -562,7 +644,8 @@ def plan(args: argparse.Namespace) -> int:
 
     print(f"\nplan vs {res['tab']!r}: {len(screens)} screenshot(s), {n_records} record(s); "
           f"flags: {counts['already-in-sheet']} already-in-sheet, "
-          f"{counts['re-shown']} re-shown, {counts['no-date']} no-date; "
+          f"{counts['re-shown']} re-shown, {counts['no-date']} no-date, "
+          f"{counts['vendor-suspect']} vendor-suspect; "
           f"{len(errors)} error(s)", file=stream)
     print("sheet untouched (values.get only); screenshots untouched in data/new/",
           file=stream)
@@ -853,7 +936,7 @@ def record_line(r: dict) -> str:
     the review table)."""
     conf = r["category_confidence"]
     conf_s = f"{conf:.2f}" if isinstance(conf, (int, float)) else "?"
-    return (f"date={r['date'] or '????-??-??'}  vendor={r['vendor'] or '—'}  "
+    return (f"date={display_date(r['date'])}  vendor={r['vendor'] or '—'}  "
             f"amount={r['amount']:.2f}  category={r['category'] or '—'} "
             f"({conf_s})  flags={','.join(r['flags']) or '-'}")
 
@@ -866,7 +949,7 @@ def edit_record(r: dict, stream=sys.stdout) -> None:
 
     while True:
         print(f"  editing: vendor={r['vendor'] or '—'}  "
-              f"date={r['date'] or '—'}  amount={r['amount']}  "
+              f"date={display_date(r['date'])}  amount={r['amount']}  "
               f"category={r['category'] or '—'}", file=stream)
         key = read_key("  edit: [v]endor [d]ate [a]mount [c]ategory "
                        "[k]eep: ", "vdack", stream)
@@ -878,9 +961,11 @@ def edit_record(r: dict, stream=sys.stdout) -> None:
                 r["vendor"] = ""
             elif raw:
                 r["vendor"] = raw
+            if raw:  # human replaced the string: the machine's flag is moot
+                r["flags"] = [f for f in r["flags"] if f != "vendor-suspect"]
         elif key == "d":
             while True:
-                raw = prompt_field("    date", stream)
+                raw = prompt_field("    date (dd/mm/yyyy)", stream)
                 if raw == "-":
                     r["date"] = None
                     break
@@ -890,7 +975,7 @@ def edit_record(r: dict, stream=sys.stdout) -> None:
                 if date:
                     r["date"] = date
                     break
-                print("    unparseable date — try 2026-09-19 or 19/9/2026 "
+                print("    unparseable date — try 19/9/2026 or 2026-09-19 "
                       "('-' clears)", file=stream)
         elif key == "a":
             while True:
@@ -952,13 +1037,13 @@ def reflag_accepted(records: list[dict], sheet_rows: list[list[str]]) -> None:
         a = parse_sheet_amount(r.get("amount"))
         if not d:
             r["flags"] = ["no-date"]
-            continue
-        flags = []
-        if (d, a) in existing:
-            flags.append("already-in-sheet")
-        if pairs.get((d, a), 0) > 1:
-            flags.append("re-shown")
-        r["flags"] = flags
+        else:
+            flags = []
+            if (d, a) in existing:
+                flags.append("already-in-sheet")
+            if pairs.get((d, a), 0) > 1:
+                flags.append("re-shown")
+            r["flags"] = flags
 
 
 def interactive_review(screens: list[dict],
