@@ -61,7 +61,20 @@ The sheet-I/O helpers here (get/append/validation) are the reusable import
 block for the later commit slice. No new Python dependencies: everything
 shells out to `gws`/`tesseract` or reuses the existing arms.
 
+With NO mode flag — the direct human run — the pipeline plans, then walks
+the reviewer through every extracted record one at a time: [y] accept,
+[n] reject, [e] edit (vendor / date / amount / category), [a] accept all
+unflagged records in one keystroke, [q] abort. Edits apply in place and
+the accepted subset is re-flagged against the already-fetched sheet rows
+(no extra API call), staging is written for what was accepted only, and
+it commits through the exact --commit path above (one values.append,
+read-back verification, then the moves). `q` aborts before any staging
+write: nothing appended, nothing moved, screenshots stay in data/new/.
+--plan and --commit remain the agent-facing contract underneath; the
+keystrokes work single-key on a TTY and line-by-line when stdin is piped.
+
 Usage:
+    uv run python scripts/import_screenshots.py     # plan → review → commit
     uv run python scripts/import_screenshots.py --tracer-sheet
     uv run python scripts/import_screenshots.py --tracer-sheet --sheet <ID> --tab "Sep 26"
     uv run python scripts/import_screenshots.py --plan --tab 'Sep 26'
@@ -459,10 +472,13 @@ def review_table(scr: dict) -> str:
     return "\n".join(lines)
 
 
-def plan(args: argparse.Namespace) -> int:
-    # --json: stdout carries only the machine document; all human progress
-    # (auth, per-screenshot lines, review table) moves to stderr.
-    stream = sys.stderr if args.json else sys.stdout
+def plan_extract(args: argparse.Namespace,
+                 stream=sys.stdout) -> dict | None:
+    """Plan-phase prologue shared by --plan and the default interactive run
+    (issues #15/#17): auth → tab validation → scan data/new/ → extract → ONE
+    values.get collision pass. Writes nothing (no staging, no sheet writes,
+    no moves). Returns the working set, or None when data/new/ holds no
+    screenshots at all (message already printed)."""
     preflight_auth()
     print("auth: gws token valid", file=stream)
 
@@ -483,7 +499,7 @@ def plan(args: argparse.Namespace) -> int:
                         if p.suffix.lower() in IMAGE_EXTS | HEIC_EXTS)
     if not candidates:
         print(f"no screenshots found in {DATA_NEW}", file=stream)
-        return 0
+        return None
 
     errors = []
     todo = []
@@ -514,8 +530,21 @@ def plan(args: argparse.Namespace) -> int:
     # One values.get collision pass — the only sheet I/O in the plan phase.
     sheet_rows = get_values(sheet_id, f"'{tab}'!A1:E")
     counts = flag_collisions(screens, sheet_rows)
+    return {"sheet_id": sheet_id, "tab": tab, "screens": screens,
+            "errors": errors, "sheet_rows": sheet_rows, "counts": counts}
 
-    staged = [write_staging(scr, tab, len(sheet_rows)) for scr in screens]
+
+def plan(args: argparse.Namespace) -> int:
+    # --json: stdout carries only the machine document; all human progress
+    # (auth, per-screenshot lines, review table) moves to stderr.
+    stream = sys.stderr if args.json else sys.stdout
+    res = plan_extract(args, stream)
+    if res is None:
+        return 0
+    screens, errors, counts = res["screens"], res["errors"], res["counts"]
+
+    staged = [write_staging(scr, res["tab"], len(res["sheet_rows"]))
+              for scr in screens]
     ERRORS_PATH.write_text(json.dumps(errors, indent=2) + "\n", encoding="utf-8")
 
     n_records = sum(len(s["records"]) for s in screens)
@@ -527,7 +556,7 @@ def plan(args: argparse.Namespace) -> int:
         print(f"staging: {path}  ({len(scr['records'])} record(s), "
               f"{flagged} flagged{note})", file=stream)
 
-    print(f"\nplan vs {tab!r}: {len(screens)} screenshot(s), {n_records} record(s); "
+    print(f"\nplan vs {res['tab']!r}: {len(screens)} screenshot(s), {n_records} record(s); "
           f"flags: {counts['already-in-sheet']} already-in-sheet, "
           f"{counts['re-shown']} re-shown, {counts['no-date']} no-date; "
           f"{len(errors)} error(s)", file=stream)
@@ -537,8 +566,8 @@ def plan(args: argparse.Namespace) -> int:
     if args.json:
         doc = {
             "mode": "plan",
-            "sheet": sheet_id,
-            "tab": tab,
+            "sheet": res["sheet_id"],
+            "tab": res["tab"],
             "planned_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "screenshots": [
                 json.loads(p.read_text(encoding="utf-8")) for p in staged],
@@ -758,10 +787,298 @@ def commit(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Interactive review (issue #17): the default no-flag human run wraps
+# the plan phase (#15) and feeds only the accepted subset into the exact
+# commit path (#16).
+# ---------------------------------------------------------------------------
+
+def read_key(prompt: str, choices: str, stream=sys.stdout) -> str:
+    """One keystroke on a TTY (cbreak — no Enter needed), one typed line
+    otherwise (piped sessions and tests work identically). Re-prompts until
+    the key is one of `choices`; raises EOFError on closed stdin; lets
+    KeyboardInterrupt (Ctrl-C) propagate — callers treat both as abort."""
+    while True:
+        stream.write(prompt)
+        stream.flush()
+        ch = None
+        if sys.stdin.isatty():
+            try:
+                import termios
+                import tty
+            except ImportError:
+                pass  # no termios (e.g. Windows): fall through to line input
+            else:
+                fd = sys.stdin.fileno()
+                saved = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    try:
+                        ch = sys.stdin.read(1)
+                    except UnicodeDecodeError:
+                        ch = "?"
+                finally:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                print(ch if ch.isprintable() else "", file=stream)
+        if ch is None:
+            line = sys.stdin.readline()
+            if not line:
+                raise EOFError
+            ch = line
+        if not ch:
+            raise EOFError
+        key = ch.strip().lower()[:1]
+        if key in choices:
+            return key
+        print(f"  ? press one of: {'/'.join(choices)}", file=stream)
+
+
+def prompt_field(label: str, stream=sys.stdout) -> str:
+    """One raw text input for the edit menu; empty line = keep current,
+    '-' = clear (the caller decides). Raises EOFError on closed stdin."""
+    stream.write(f"{label}: ")
+    stream.flush()
+    line = sys.stdin.readline()
+    if not line:
+        raise EOFError
+    return line.strip()
+
+
+def record_line(r: dict) -> str:
+    """One-line rendering of a record for the review walk (same fields as
+    the review table)."""
+    conf = r["category_confidence"]
+    conf_s = f"{conf:.2f}" if isinstance(conf, (int, float)) else "?"
+    return (f"date={r['date'] or '????-??-??'}  vendor={r['vendor'] or '—'}  "
+            f"amount={r['amount']:.2f}  category={r['category'] or '—'} "
+            f"({conf_s})  flags={','.join(r['flags']) or '-'}")
+
+
+def edit_record(r: dict, stream=sys.stdout) -> None:
+    """[v]endor / [d]ate / [a]mount / [c]ategory / [k]eep loop; edits apply
+    to the record in place (staging + commit pick them up). Empty input
+    keeps the current value; '-' clears the field."""
+    from run_jev_arm import CATEGORIES
+
+    while True:
+        print(f"  editing: vendor={r['vendor'] or '—'}  "
+              f"date={r['date'] or '—'}  amount={r['amount']}  "
+              f"category={r['category'] or '—'}", file=stream)
+        key = read_key("  edit: [v]endor [d]ate [a]mount [c]ategory "
+                       "[k]eep: ", "vdack", stream)
+        if key == "k":
+            return
+        if key == "v":
+            raw = prompt_field("    vendor", stream)
+            if raw == "-":
+                r["vendor"] = ""
+            elif raw:
+                r["vendor"] = raw
+        elif key == "d":
+            while True:
+                raw = prompt_field("    date", stream)
+                if raw == "-":
+                    r["date"] = None
+                    break
+                if not raw:
+                    break
+                date = parse_sheet_date(raw)
+                if date:
+                    r["date"] = date
+                    break
+                print("    unparseable date — try 2026-09-19 or 19/9/2026 "
+                      "('-' clears)", file=stream)
+        elif key == "a":
+            while True:
+                raw = prompt_field("    amount", stream)
+                if not raw:
+                    break
+                amount = parse_sheet_amount(raw)
+                if amount is not None:
+                    r["amount"] = amount
+                    break
+                print("    unparseable amount — try -45.67 or $1,234.50",
+                      file=stream)
+        elif key == "c":
+            print("    enum: " + " | ".join(
+                f"{i + 1}={c}" for i, c in enumerate(CATEGORIES)), file=stream)
+            while True:
+                raw = prompt_field(
+                    "    category (number or exact text, '-' clears)", stream)
+                if raw == "-":
+                    r["category"] = None
+                    r["category_confidence"] = None
+                    break
+                if not raw:
+                    break
+                if raw.isdigit() and 1 <= int(raw) <= len(CATEGORIES):
+                    r["category"] = CATEGORIES[int(raw) - 1]
+                    r["category_confidence"] = None
+                    break
+                match = next((c for c in CATEGORIES
+                              if c.lower() == raw.lower()), None)
+                if match:
+                    r["category"] = match
+                    r["category_confidence"] = None
+                    break
+                print("    not in the category enum — pick a number or the "
+                      "exact text", file=stream)
+
+
+def reflag_accepted(records: list[dict], sheet_rows: list[list[str]]) -> None:
+    """Rebuild flags over the accepted subset with the sheet rows already
+    fetched at plan time (no extra API call): edits can move a record onto
+    or off of a collision, rejects can dissolve a re-shown pair."""
+    existing = set()
+    for row in sheet_rows[1:]:
+        d = parse_sheet_date(row[0] if row else None)
+        a = parse_sheet_amount(row[3] if len(row) > 3 else None)
+        if d and a is not None:
+            existing.add((d, a))
+
+    pairs: dict[tuple[str, float], int] = {}
+    for r in records:
+        d = parse_sheet_date(r.get("date"))
+        a = parse_sheet_amount(r.get("amount"))
+        if d and a is not None:
+            pairs[(d, a)] = pairs.get((d, a), 0) + 1
+
+    for r in records:
+        d = parse_sheet_date(r.get("date"))
+        a = parse_sheet_amount(r.get("amount"))
+        if not d:
+            r["flags"] = ["no-date"]
+            continue
+        flags = []
+        if (d, a) in existing:
+            flags.append("already-in-sheet")
+        if pairs.get((d, a), 0) > 1:
+            flags.append("re-shown")
+        r["flags"] = flags
+
+
+def interactive_review(screens: list[dict],
+                       stream=sys.stdout) -> list[tuple[dict, list[dict]]] | None:
+    """Walk the reviewer through every record: y accept, n reject, e edit,
+    a accept-all-unflagged, q abort. Edits mutate records in place. Returns
+    [(screen, [accepted records])] in original order, or None on abort."""
+    for scr in screens:
+        print(f"\n== {scr['file']}  (capture {scr['capture_time']}) ==",
+              file=stream)
+        print(review_table(scr), file=stream)
+
+    flat = [(si, ri, r) for si, scr in enumerate(screens)
+            for ri, r in enumerate(scr["records"])]
+    print(f"\n{len(flat)} record(s) to review: [y] accept  [n] reject  "
+          "[e] edit  [a] accept all unflagged  [q] abort", file=stream)
+
+    verdict: dict[tuple[int, int], str] = {}
+    pos = 0
+    while pos < len(flat):
+        si, ri, r = flat[pos]
+        if (si, ri) in verdict:
+            pos += 1  # already decided (an `a` sweep ran ahead of the cursor)
+            continue
+        print(f"\n[{pos + 1}/{len(flat)}] {screens[si]['file']}: "
+              f"{record_line(r)}", file=stream)
+        key = read_key("  accept? [y]es [n]o [e]dit [a]ll unflagged "
+                       "[q]uit: ", "yneaq", stream)
+        if key == "y":
+            if not parse_sheet_date(r.get("date")):
+                print("  no usable date — commit refuses null dates; "
+                      "edit (e) or reject (n)", file=stream)
+                continue
+            amount = r.get("amount")
+            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+                print("  no usable amount — edit (e) or reject (n)",
+                      file=stream)
+                continue
+            verdict[(si, ri)] = "y"
+            pos += 1
+        elif key == "n":
+            verdict[(si, ri)] = "n"
+            pos += 1
+        elif key == "e":
+            edit_record(r, stream)  # re-prompt the same record after edits
+        elif key == "a":
+            took = 0
+            for s2, r2i, r2 in flat:
+                if (s2, r2i) not in verdict and not r2["flags"]:
+                    verdict[(s2, r2i)] = "y"
+                    took += 1
+            print(f"  accepted {took} unflagged record(s)"
+                  if took else "  no undecided unflagged records left",
+                  file=stream)
+            if (si, ri) in verdict:
+                pos += 1  # the record under the cursor was unflagged: taken
+        elif key == "q":
+            return None
+
+    return [(scr, [r for ri, r in enumerate(scr["records"])
+                   if verdict.get((si, ri)) == "y"])
+            for si, scr in enumerate(screens)]
+
+
+def interactive(args: argparse.Namespace) -> int:
+    """Default run (no mode flag): plan (#15), then per-record review (#17),
+    then commit the accepted subset through the exact --commit path (#16)."""
+    stream = sys.stdout
+    res = plan_extract(args, stream)
+    if res is None:
+        return 0
+    screens, errors, sheet_rows = (res["screens"], res["errors"],
+                                   res["sheet_rows"])
+    ERRORS_PATH.write_text(json.dumps(errors, indent=2) + "\n", encoding="utf-8")
+
+    n_records = sum(len(s["records"]) for s in screens)
+    if not n_records:
+        print(f"no records extracted ({len(errors)} error(s)) — "
+              "nothing to review", file=stream)
+        return 1 if errors else 0
+
+    try:
+        decisions = interactive_review(screens, stream)
+    except (KeyboardInterrupt, EOFError):
+        print(file=stream)
+        decisions = None
+    if decisions is None:
+        print("\nabort: nothing appended, nothing moved — screenshots "
+              "remain in data/new/", file=stream)
+        return 1
+
+    accepted = [(scr, recs) for scr, recs in decisions if recs]
+    all_accepted = [r for _, recs in accepted for r in recs]
+    reflag_accepted(all_accepted, sheet_rows)
+    n_rejected = n_records - len(all_accepted)
+    print(f"\nreview done: {len(all_accepted)} accepted, {n_rejected} rejected",
+          file=stream)
+
+    if not accepted:
+        print("nothing accepted — no staging written, sheet untouched, "
+              "screenshots stay in data/new/", file=stream)
+        return 0
+
+    staged = [write_staging(dict(scr, records=recs), res["tab"],
+                            len(sheet_rows)) for scr, recs in accepted]
+    for (scr, recs), path in zip(accepted, staged):
+        print(f"staging: {path}  ({len(recs)} accepted record(s))", file=stream)
+    if errors:
+        print(f"note: {len(errors)} screenshot(s) failed extraction "
+              f"(see {ERRORS_PATH}) — nothing was reviewed for them",
+              file=stream)
+
+    commit_args = argparse.Namespace(sheet=args.sheet, tab=res["tab"],
+                                     staging=[str(p) for p in staged])
+    print(f"\ncommitting {len(all_accepted)} accepted record(s) to "
+          f"{res['tab']!r} via the --commit path...", file=stream)
+    return commit(commit_args)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Import pipeline (issue #13: sheet tracer, #15: plan "
-                    "phase, #16: commit phase)")
+                    "phase, #16: commit phase; no mode flag: interactive "
+                    "review, #17)")
     parser.add_argument("--tracer-sheet", action="store_true",
                         help="run the sheet-layer round-trip tracer")
     parser.add_argument("--plan", action="store_true",
@@ -801,8 +1118,9 @@ def main() -> None:
     elif args.commit:
         raise SystemExit(commit(args))
     else:
-        parser.print_help()
-        raise TracerError("pick a mode, e.g. --plan or --tracer-sheet")
+        # Default: the direct human run (issue #17) — plan, interactive
+        # review, commit the accepted subset.
+        raise SystemExit(interactive(args))
 
 
 if __name__ == "__main__":
