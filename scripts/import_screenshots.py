@@ -77,6 +77,7 @@ write: nothing appended, nothing moved, screenshots stay in data/new/.
 keystrokes work single-key on a TTY and line-by-line when stdin is piped.
 
 Usage:
+    record     # same as below with no mode flag; wrapper symlinked onto PATH
     uv run python scripts/import_screenshots.py     # plan → review → commit
     uv run python scripts/import_screenshots.py --tracer-sheet
     uv run python scripts/import_screenshots.py --tracer-sheet --sheet <ID> --tab "Sep 26"

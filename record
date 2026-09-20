@@ -1,0 +1,13 @@
+#!/bin/sh
+# record — bank-screenshot import pipeline (receipt-extraction repo).
+#
+#   record                open data/new/, drop screenshots in, Enter,
+#                         y/n/e/a/q review, accepted rows committed
+#   record --plan         plan only (agent-facing)
+#   record --commit --staging data/out/import/<stem>.json [--tab 'Sep 26']
+#   record --tracer-sheet sheet-layer round-trip tracer
+#
+# All flags pass through to scripts/import_screenshots.py unchanged.
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+REPO="$(cd "$(dirname "$SELF")" && pwd)"
+exec uv run --project "$REPO" python "$REPO/scripts/import_screenshots.py" "$@"
