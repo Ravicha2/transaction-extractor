@@ -67,15 +67,20 @@ shells out to `gws`/`tesseract` or reuses the existing arms.
 With NO mode flag — the direct human run — the pipeline first opens
 data/new/ in the file manager and waits for the reviewer to drop this
 month's screenshots in (Enter scans, q aborts, re-prompts while the
-folder is empty). It then plans, walks the reviewer through every
-extracted record one at a time: [y] accept, [n] reject, [e] edit
-(vendor / date / amount / category), [a] accept all unflagged records
-in one keystroke, [q] abort. Edits apply in place and the accepted
-subset is re-flagged against the already-fetched sheet rows (no extra
-API call), staging is written for what was accepted only, and it
-commits through the exact --commit path above (one values.append,
-read-back verification, then the moves). `q` aborts before any staging
-write: nothing appended, nothing moved, screenshots stay in data/new/.
+folder is empty). It then plans, and reviews day by day, newest day
+first: each day's records are listed together and the reviewer keeps
+[a]ll, [n]one, exact rows by number (1,3,4,5 — the rest of the day is
+dropped), or [e]<num>-edits one (vendor / date / amount / category)
+before deciding; [q] aborts at any prompt. Vendor sanity is judged by
+the same Jev call as the category (a noul yes/no on the OCR line) and
+mangled vendors are flagged `vendor-suspect` — review edits or rejects
+them, never discards. Edits apply in place and the grouping re-sorts,
+so an edited date moves the record to its own day. The accepted subset
+is re-flagged against the already-fetched sheet rows (no extra API
+call), staging is written for what was accepted only, and it commits
+through the exact --commit path above (one values.append, read-back
+verification, then the moves). `q` aborts before any staging write:
+nothing appended, nothing moved, screenshots stay in data/new/.
 --plan and --commit remain the agent-facing contract underneath; the
 keystrokes work single-key on a TTY and line-by-line when stdin is piped.
 
@@ -931,14 +936,16 @@ def prompt_field(label: str, stream=sys.stdout) -> str:
     return line.strip()
 
 
-def record_line(r: dict) -> str:
-    """One-line rendering of a record for the review walk (same fields as
-    the review table)."""
+def group_line(num: int, r: dict, fname: str | None = None) -> str:
+    """One numbered line for a day-group member (date lives in the group
+    header; source file shown only when several screenshots are in play)."""
     conf = r["category_confidence"]
     conf_s = f"{conf:.2f}" if isinstance(conf, (int, float)) else "?"
-    return (f"date={display_date(r['date'])}  vendor={r['vendor'] or '—'}  "
-            f"amount={r['amount']:.2f}  category={r['category'] or '—'} "
-            f"({conf_s})  flags={','.join(r['flags']) or '-'}")
+    src = f"  [{fname}]" if fname else ""
+    return (f"  [{num}] {r['amount']:>9.2f}  "
+            f"{(r['vendor'] or '—')[:34]:<34} "
+            f"{(r['category'] or '—'):<24} ({conf_s})  "
+            f"flags={','.join(r['flags']) or '-'}{src}")
 
 
 def edit_record(r: dict, stream=sys.stdout) -> None:
@@ -1046,11 +1053,111 @@ def reflag_accepted(records: list[dict], sheet_rows: list[list[str]]) -> None:
             r["flags"] = flags
 
 
+def day_groups(flat: list[tuple[int, int, dict]],
+               verdict: dict[tuple[int, int], str]
+               ) -> list[tuple[str, list[tuple[int, int, dict]]]]:
+    """Undecided records grouped by date, newest day first, unknown dates
+    last. flat is (screen_idx, record_idx, record); verdict keys are decided
+    and excluded. Groups span screenshots — the same day from two captures
+    reviews together."""
+    groups: dict[str, list[tuple[int, int, dict]]] = {}
+    for si, ri, r in flat:
+        if (si, ri) in verdict:
+            continue
+        key = parse_sheet_date(r.get("date")) or ""
+        groups.setdefault(key, []).append((si, ri, r))
+    order = sorted((k for k in groups if k), reverse=True)
+    if "" in groups:
+        order.append("")
+    return [(k, groups[k]) for k in order]
+
+
+def resolve_day(iso: str, items: list[tuple[int, int, dict]], verdict: dict,
+                fname_of: dict[int, str], multi: bool,
+                stream=sys.stdout) -> str | None:
+    """Present one day's records together and resolve every one to accept or
+    reject: [a] keep all, [n] keep none, numbers like 1,3,4,5 keep exactly
+    those and drop the rest of the day, [e]<num> edits one in place, [q]
+    aborts the whole review (None). A selection naming a record without a
+    usable date decides nothing — fix the date with e<num> or reselect.
+    Records without a usable date can never be kept as-is (commit refuses
+    null dates)."""
+    head = display_date(iso) if iso else "unknown date — edit or reject"
+    wd = ""
+    if iso:
+        wd = datetime.strptime(iso, "%Y-%m-%d").strftime(" (%a)")
+    while True:
+        remaining = [(n, si, ri, r)
+                     for n, (si, ri, r) in enumerate(items, 1)
+                     if (si, ri) not in verdict]
+        if not remaining:
+            return "ok"
+        print(f"\n── {head}{wd} — {len(remaining)} record(s) ──", file=stream)
+        for n, si, ri, r in remaining:
+            print(group_line(n, r, fname_of[si] if multi else None), file=stream)
+        raw = prompt_field("keep which? [a]ll [n]one [e]<num> edit, or "
+                           "numbers like 1,3,4,5 ([q]uit)", stream).strip().lower()
+        if not raw:
+            print("  ? a, n, numbers like 1,3,4,5, e<num>, or q", file=stream)
+            continue
+        if raw == "q":
+            return None
+        if raw == "a":
+            blocked = 0
+            for n, si, ri, r in remaining:
+                if not parse_sheet_date(r.get("date")):
+                    blocked += 1
+                    continue
+                verdict[(si, ri)] = "y"
+            if blocked:
+                print(f"  kept {len(remaining) - blocked}; {blocked} record(s) "
+                      "have no usable date — edit (e<num>) or n", file=stream)
+            continue
+        if raw == "n":
+            for n, si, ri, r in remaining:
+                verdict[(si, ri)] = "n"
+            continue
+        if raw.startswith("e"):
+            num = raw[1:].strip().strip(",")
+            pick = next((x for x in remaining if str(x[0]) == num), None) \
+                if num.isdigit() else None
+            if pick is None:
+                print(f"  ? e<num> with a number shown above (got {raw!r})",
+                      file=stream)
+                continue
+            edit_record(pick[3], stream)  # re-list the day after editing
+            continue
+        nums = re.split(r"[,\s]+", raw)
+        if all(p.isdigit() for p in nums):
+            rows = {x[0]: x for x in remaining}
+            unknown = [p for p in nums if int(p) not in rows]
+            if unknown:
+                print(f"  ? no such row(s): {', '.join(unknown)} — nothing "
+                      "decided", file=stream)
+                continue
+            nodate = [rows[int(p)] for p in nums
+                      if not parse_sheet_date(rows[int(p)][3].get("date"))]
+            if nodate:
+                print("  ? row(s) " + ", ".join(f"[{x[0]}]" for x in nodate)
+                      + " have no usable date — edit (e<num>) or reselect; "
+                        "nothing decided", file=stream)
+                continue
+            keep = {int(p) for p in nums}
+            for n, si, ri, r in remaining:
+                verdict[(si, ri)] = "y" if n in keep else "n"
+            print(f"  kept {', '.join(str(n) for n in sorted(keep))} · "
+                  f"dropped {len(remaining) - len(keep)}", file=stream)
+            continue
+        print("  ? a, n, numbers like 1,3,4,5, e<num>, or q", file=stream)
+
+
 def interactive_review(screens: list[dict],
                        stream=sys.stdout) -> list[tuple[dict, list[dict]]] | None:
-    """Walk the reviewer through every record: y accept, n reject, e edit,
-    a accept-all-unflagged, q abort. Edits mutate records in place. Returns
-    [(screen, [accepted records])] in original order, or None on abort."""
+    """Review day by day, newest first: each day's records are listed
+    together and resolved with a/n/numbers/e<num> (q aborts). Edits mutate
+    records in place and the grouping re-sorts, so an edited date moves the
+    record to its own day. Returns [(screen, [accepted records])] in
+    original order, or None on abort."""
     for scr in screens:
         print(f"\n== {scr['file']}  (capture {scr['capture_time']}) ==",
               file=stream)
@@ -1058,49 +1165,20 @@ def interactive_review(screens: list[dict],
 
     flat = [(si, ri, r) for si, scr in enumerate(screens)
             for ri, r in enumerate(scr["records"])]
-    print(f"\n{len(flat)} record(s) to review: [y] accept  [n] reject  "
-          "[e] edit  [a] accept all unflagged  [q] abort", file=stream)
+    fname_of = {si: Path(scr["file"]).name for si, scr in enumerate(screens)}
+    multi = len(screens) > 1
+    print(f"\n{len(flat)} record(s) from {len(screens)} screenshot(s), "
+          "newest day first. Per day: [a] keep all, [n] none, numbers like "
+          "1,3,4,5 keep exactly those (rest dropped), [e]<num> edit, "
+          "[q] abort", file=stream)
 
     verdict: dict[tuple[int, int], str] = {}
-    pos = 0
-    while pos < len(flat):
-        si, ri, r = flat[pos]
-        if (si, ri) in verdict:
-            pos += 1  # already decided (an `a` sweep ran ahead of the cursor)
-            continue
-        print(f"\n[{pos + 1}/{len(flat)}] {screens[si]['file']}: "
-              f"{record_line(r)}", file=stream)
-        key = read_key("  accept? [y]es [n]o [e]dit [a]ll unflagged "
-                       "[q]uit: ", "yneaq", stream)
-        if key == "y":
-            if not parse_sheet_date(r.get("date")):
-                print("  no usable date — commit refuses null dates; "
-                      "edit (e) or reject (n)", file=stream)
-                continue
-            amount = r.get("amount")
-            if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-                print("  no usable amount — edit (e) or reject (n)",
-                      file=stream)
-                continue
-            verdict[(si, ri)] = "y"
-            pos += 1
-        elif key == "n":
-            verdict[(si, ri)] = "n"
-            pos += 1
-        elif key == "e":
-            edit_record(r, stream)  # re-prompt the same record after edits
-        elif key == "a":
-            took = 0
-            for s2, r2i, r2 in flat:
-                if (s2, r2i) not in verdict and not r2["flags"]:
-                    verdict[(s2, r2i)] = "y"
-                    took += 1
-            print(f"  accepted {took} unflagged record(s)"
-                  if took else "  no undecided unflagged records left",
-                  file=stream)
-            if (si, ri) in verdict:
-                pos += 1  # the record under the cursor was unflagged: taken
-        elif key == "q":
+    while True:
+        groups = day_groups(flat, verdict)
+        if not groups:
+            break
+        iso, items = groups[0]
+        if resolve_day(iso, items, verdict, fname_of, multi, stream) is None:
             return None
 
     return [(scr, [r for ri, r in enumerate(scr["records"])
