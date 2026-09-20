@@ -61,13 +61,16 @@ The sheet-I/O helpers here (get/append/validation) are the reusable import
 block for the later commit slice. No new Python dependencies: everything
 shells out to `gws`/`tesseract` or reuses the existing arms.
 
-With NO mode flag — the direct human run — the pipeline plans, then walks
-the reviewer through every extracted record one at a time: [y] accept,
-[n] reject, [e] edit (vendor / date / amount / category), [a] accept all
-unflagged records in one keystroke, [q] abort. Edits apply in place and
-the accepted subset is re-flagged against the already-fetched sheet rows
-(no extra API call), staging is written for what was accepted only, and
-it commits through the exact --commit path above (one values.append,
+With NO mode flag — the direct human run — the pipeline first opens
+data/new/ in the file manager and waits for the reviewer to drop this
+month's screenshots in (Enter scans, q aborts, re-prompts while the
+folder is empty). It then plans, walks the reviewer through every
+extracted record one at a time: [y] accept, [n] reject, [e] edit
+(vendor / date / amount / category), [a] accept all unflagged records
+in one keystroke, [q] abort. Edits apply in place and the accepted
+subset is re-flagged against the already-fetched sheet rows (no extra
+API call), staging is written for what was accepted only, and it
+commits through the exact --commit path above (one values.append,
 read-back verification, then the moves). `q` aborts before any staging
 write: nothing appended, nothing moved, screenshots stay in data/new/.
 --plan and --commit remain the agent-facing contract underneath; the
@@ -1019,10 +1022,54 @@ def interactive_review(screens: list[dict],
             for si, scr in enumerate(screens)]
 
 
+def gate_new_folder(stream=None) -> bool:
+    """First step of the direct human run: open data/new/ in the file
+    manager so the reviewer can drop this month's screenshots in, then
+    wait for Enter to scan. Re-prompts while the folder holds no
+    screenshots; q (Ctrl-C/EOF included) aborts → False."""
+    stream = stream or sys.stdout
+    DATA_NEW.mkdir(parents=True, exist_ok=True)
+
+    def n_images() -> int:
+        return sum(1 for p in DATA_NEW.iterdir()
+                   if p.suffix.lower() in IMAGE_EXTS | HEIC_EXTS)
+
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    try:
+        subprocess.run([opener, str(DATA_NEW)],
+                       capture_output=True, timeout=10)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        print(f"(could not auto-open a file manager) — put screenshots in "
+              f"{DATA_NEW}", file=stream)
+    else:
+        print(f"opened {DATA_NEW.relative_to(ROOT)} in the file manager",
+              file=stream)
+    if n := n_images():
+        print(f"{n} screenshot(s) already in data/new/", file=stream)
+    while True:
+        print("drop screenshots there, then press Enter to scan "
+              "(q to abort): ", end="", file=stream)
+        stream.flush()
+        line = sys.stdin.readline()
+        if not line:
+            return False
+        if line.strip().lower()[:1] == "q":
+            return False
+        if n_images():
+            return True
+        print(f"  still no screenshots in {DATA_NEW.relative_to(ROOT)} — "
+              "drop them in, then Enter again", file=stream)
+
+
 def interactive(args: argparse.Namespace) -> int:
-    """Default run (no mode flag): plan (#15), then per-record review (#17),
-    then commit the accepted subset through the exact --commit path (#16)."""
+    """Default run (no mode flag): open data/new/ and wait for screenshots,
+    then plan (#15), per-record review (#17), then commit the accepted
+    subset through the exact --commit path (#16)."""
     stream = sys.stdout
+    if not gate_new_folder(stream):
+        print("\nabort: nothing scanned, nothing appended, nothing moved",
+              file=stream)
+        return 1
     res = plan_extract(args, stream)
     if res is None:
         return 0
