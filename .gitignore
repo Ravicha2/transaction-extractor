@@ -1,0 +1,10 @@
+# Bank screenshots and everything derived from them — never pushed (scope.md hygiene)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store

@@ -1,0 +1,13 @@
+{
+  "status": "frozen",
+  "frozen_at": "2026-09-20",
+  "note": "Personal category enum for labeled records. Frozen per scope.md before any labeling (issue #3) — never changed after this date. Extracted categories must match these strings exactly.",
+  "categories": [
+    "grocery & eat out",
+    "catering payment",
+    "fitness & health",
+    "transport",
+    "deposits & tax",
+    "Misc and souvenir"
+  ]
+}
