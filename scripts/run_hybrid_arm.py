@@ -64,6 +64,7 @@ ENUM_DEFINITIONS = (
     "'health & fitness' = pharmacy, medical, gym, sport; "
     "'tuition fee' = school or university payments; "
     "'deposit' = cash deposits, incoming money, income; "
+    "'withdraw' = cash withdrawals, ATM cash-outs; "
     "'transport' = public transport, fuel, rides; "
     "'Misc and souvenir' = everything else, gifts, utilities, donations."
 )

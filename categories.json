@@ -1,13 +1,14 @@
 {
   "status": "frozen",
   "frozen_at": "2026-09-20",
-  "note": "Personal category enum for labeled records. Amended 2026-09-20 (same day as first freeze, before any eval ran): superseded the provisional 6-category list after reviewing what was actually recorded in ground_truth.csv — these strings are verbatim from the recorded ground truth. Never changed after this date. Extracted categories must match these strings exactly.",
+  "note": "Personal category enum for labeled records. Amended 2026-09-20 (same day as first freeze, before any eval ran): superseded the provisional 6-category list after reviewing what was actually recorded in ground_truth.csv — these strings are verbatim from the recorded ground truth. Re-amended 2026-09-20 (still before any full-corpus eval): the ground-truth update for the extended ~30-screenshot corpus added 'withdraw'; kept verbatim to ground_truth.csv per the same rule. Never changed after this date. Extracted categories must match these strings exactly.",
   "categories": [
     "Misc and souvenir",
     "health & fitness",
     "grocery&eat out",
     "deposit",
     "tuition fee",
-    "transport"
+    "transport",
+    "withdraw"
   ]
 }
