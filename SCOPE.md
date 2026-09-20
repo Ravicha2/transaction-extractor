@@ -9,6 +9,9 @@ This is a model trial, not a product. The deliverable is numbers, not a tool.
 Original "receipt photo" framing was dropped during scoping: I don't keep paper receipts;
 the corpus I have and the pain I feel are bank screenshots.
 
+> **2026-09-20: v1 verdict is in and v2 is chartered** — see "v2 verdict of v1" and
+> "v2 scope" below. Everything down to "Success check" is v1, kept verbatim for the record.
+
 ## Corpus & labels (freeze before any pipeline code)
 
 - ~30 bank-app screenshots (one bank, same phone). List views; multiple transactions per screenshot.
@@ -57,6 +60,51 @@ A screenshot yields a **list of records**:
 - LoRA fine-tuning (`needle build`) — the natural *second* weekend, decided by this one's numbers
 - Paper receipts, email/PDF receipts (Docling), canonical vendor renaming
 - `tax`/GST, line items, spreadsheet/CSV integration, confidence-gate UX, any auto-action
+  - ↑ **superseded 2026-09-20 by v2, below** — spreadsheet integration is now the point
+    (v1's line preserved for history; the *hygiene* rule — `data/` never pushed — still stands)
+
+## v2 verdict of v1 (recorded 2026-09-20)
+
+The measured trial is over; the numbers decided:
+
+- **Record recovery 85.0% — FAIL** vs the 90% bar (34/40 labels matched; 6 field-attach
+  misses, 31 extras — the sticky-header/re-showing attachment problem, not OCR: `ocr_miss`
+  cohort was empty).
+- **jev category accuracy 94.1% — PASS** vs the 85% bar (32/34 matched records; only two
+  `grocery&eat out` → `Misc and souvenir` confusions). Choice-over-enum is the right
+  primitive for the only field a model must win.
+- **needle3 is dead as a field-attacher**: same records, category accuracy 37.5% — it
+  collapsed onto `Misc and souvenir`. The v1 premise (needle3 attaches fields) is falsified;
+  what survives is hybrid: deterministic day-grouping + regex for date/amount, a model only
+  for the category enum.
+- Calibration readout: needle3's confidence did not separate correct from incorrect — score
+  decoration, per the most-interesting-finding clause. (REPORT.md landed in the gitignored
+  `data/out/`; the eval JSONs in `data/out/eval/` are the numbers above.)
+
+## v2 scope (2026-09-20): production import, monthly
+
+Not a model trial anymore — the pipeline the numbers picked, run for real:
+
+- **Pipeline**: hybrid extraction (day-grouping + regex date/amount) → **jev** category
+  mapper (open-jev / jev-schema-scorer, 94.1% on the enum job) → the sheet-I/O block proven
+  by the issue-#13 tracer (auth preflight, tab check, header validation, append).
+- **Workbook**: "2026 AUS expense" via `gws`. **Auth model**: OAuth as clankeralpha@gmail.com
+  (gws CLI keyring), a *shared writer* on rsuksawasdi@gmail.com's workbook. `SHEET_ID` lives
+  in the gitignored `.env`; gws token refresh is a preflight, never an inline write.
+- **Monthly tabs with explicit `--tab`** (e.g. `Sep 26`), headers frozen as
+  `date | vendor | category | amount | Total` and validated before any append. September
+  2026 onward; August-and-earlier stays hand-entered.
+- **Plan/commit review gate**: the import is two-phase — `plan` writes a staging JSON +
+  review table and touches nothing; `commit` appends only after explicit human approval.
+  Tracers (`--tracer-sheet`) write only to self-created `_tracer_*` scratch tabs, deleted
+  after the round-trip.
+- **Agent-skill intent**: the CLI gets wrapped as an agent skill, with mandatory human
+  approval at the commit gate — the agent plans, the human commits.
+
+## v2 out of scope (still)
+
+- LoRA fine-tuning (revisit only if the hybrid+jev combo degrades on live months)
+- Paper/email/PDF receipts, vendor renaming, `tax`/GST, line items, auto-commit without a human
 
 ## Hygiene
 
